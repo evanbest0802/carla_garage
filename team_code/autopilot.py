@@ -1207,6 +1207,13 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         for actor_idx, actor in enumerate(nearby_actors):
           predicted_actor_boxes = []
 
+          # This actor's own bounding box size is constant across the whole forecast
+          # horizon -- query it once per actor instead of once per actor per forecast
+          # step (see the matching comment in forecast_ego_agent for why this read is
+          # not a free local lookup on a passive/non-ticking client).
+          base_extent = actor.bounding_box.extent
+          base_extent = carla.Vector3D(x=base_extent.x, y=base_extent.y, z=base_extent.z)
+
           for i in range(num_future_frames):
             # Calculate the future location of the actor
             location = carla.Location(x=future_locations[i, actor_idx, 0].item(),
@@ -1217,9 +1224,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
             rotation = carla.Rotation(pitch=0, yaw=future_headings[i, actor_idx], roll=0)
 
             # Get the extent (dimensions) of the actor's bounding box
-            extent = actor.bounding_box.extent
-            # Otherwise we would increase the extent of the bounding box of the vehicle
-            extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
+            extent = carla.Vector3D(x=base_extent.x, y=base_extent.y, z=base_extent.z)
 
             # Adjust the bounding box size based on velocity and lane change maneuver to adjust for
             # uncertainty during forecasting
@@ -1604,6 +1609,29 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     action = np.array([steering, throttle, 0.0]).flatten()
 
     future_bounding_boxes = []
+
+    # The ego vehicle's own bounding box size is constant for the whole forecast
+    # horizon (it doesn't change tick to tick), and this scaling depends only on
+    # current_ego_speed/self.config, both fixed for this call. Query it once instead
+    # of once per forecast substep below: actor.bounding_box is a CARLA RPC property
+    # read, not a free local lookup, and its latency depends heavily on whether this
+    # process itself owns world.tick() -- when it doesn't (a passive/non-ticking
+    # client, e.g. this agent driven from outside a leaderboard-style harness that
+    # owns the tick loop), each read can cost orders of magnitude more than when this
+    # process is the one calling tick(). Re-reading an unchanging value
+    # num_future_frames times here was the dominant cost of this function in that
+    # situation.
+    # Decrease the ego vehicles bounding box if it is slow and resolve permanent bounding box
+    # intersectinos at collisions.
+    # In case of driving increase them for safety.
+    extent = self._vehicle.bounding_box.extent
+    # Otherwise we would increase the extent of the bounding box of the vehicle
+    extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
+    extent.x *= self.config.slow_speed_extent_factor_ego if current_ego_speed < \
+                    self.config.extent_ego_bbs_speed_threshold else self.config.high_speed_extent_factor_ego_x
+    extent.y *= self.config.slow_speed_extent_factor_ego if current_ego_speed < \
+                    self.config.extent_ego_bbs_speed_threshold else self.config.high_speed_extent_factor_ego_y
+
     # Iterate over the future frames and forecast the ego agent's state
     for _ in range(num_future_frames):
       # Forecast the next state using the kinematic bicycle model
@@ -1616,17 +1644,6 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       action = np.array([steering, throttle, 0.0]).flatten()
 
       heading_angle_degrees = np.rad2deg(heading_angle).item()
-
-      # Decrease the ego vehicles bounding box if it is slow and resolve permanent bounding box
-      # intersectinos at collisions.
-      # In case of driving increase them for safety.
-      extent = self._vehicle.bounding_box.extent
-      # Otherwise we would increase the extent of the bounding box of the vehicle
-      extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
-      extent.x *= self.config.slow_speed_extent_factor_ego if current_ego_speed < \
-                      self.config.extent_ego_bbs_speed_threshold else self.config.high_speed_extent_factor_ego_x
-      extent.y *= self.config.slow_speed_extent_factor_ego if current_ego_speed < \
-                      self.config.extent_ego_bbs_speed_threshold else self.config.high_speed_extent_factor_ego_y
 
       transform = carla.Transform(carla.Location(x=location[0].item(), y=location[1].item(), z=location[2].item()))
 
