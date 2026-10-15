@@ -191,6 +191,15 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self._vehicle = CarlaDataProvider.get_hero_actor()
     self._world = self._vehicle.get_world()
 
+    # The vehicle's bounding box is a constant physical property for its whole lifetime, not
+    # something that changes tick to tick -- but self._vehicle.bounding_box is a CARLA RPC
+    # property read whose latency depends heavily on whether this process owns world.tick()
+    # (same effect documented on forecast_ego_agent()'s old per-substep extent read, and on
+    # get_brake_and_target_speed()'s ego_speed/transform reads -- see _get_control()). Read it
+    # once here, for the vehicle's whole episode, instead of on every call site that needs it.
+    self._ego_bb_location = self._vehicle.bounding_box.location
+    self._ego_bb_extent = self._vehicle.bounding_box.extent
+
     # Check if the vehicle starts from a parking spot
     distance_to_road = self.org_dense_route_world_coord[0][0].location.distance(self._vehicle.get_location())
     # The first waypoint starts at the lane center, hence it's more than 2 m away from the center of the
@@ -338,6 +347,15 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     tick_data = self.tick_autopilot(input_data)
     ego_position = tick_data["gps"]
 
+    # Read once per tick and reuse everywhere below instead of each call-site re-reading it:
+    # self._vehicle.get_transform() is a CARLA RPC property read, not a free local lookup, and
+    # its latency depends heavily on whether this process owns world.tick() (see
+    # forecast_ego_agent()'s bounding_box.extent comment for the same effect, measured on a
+    # passive/non-ticking harness). The vehicle cannot move again before this tick's control is
+    # applied, so every read below this point in the same _get_control() call would return the
+    # same transform anyway.
+    ego_vehicle_transform = self._vehicle.get_transform()
+
     # Waypoint planning and route generation
     route_np, route_wp, _, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,\
                                     next_stop_sign, speed_limit = self._waypoint_planner.run_step(ego_position)
@@ -372,12 +390,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     else:
       brake, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
           plant, route_np, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,
-          next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj)
+          next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj, ego_speed, ego_vehicle_transform)
 
     target_speed = min(target_speed, target_speed_route_obstacle)
 
     # Determine if the ego vehicle is at a junction
-    ego_vehicle_waypoint = self.world_map.get_waypoint(self._vehicle.get_location())
+    ego_vehicle_waypoint = self.world_map.get_waypoint(ego_vehicle_transform.location)
     self.junction = ego_vehicle_waypoint.is_junction
 
     # Compute throttle and brake control
@@ -553,7 +571,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
       # Compute the distance and time needed for the ego vehicle to overtake
       ego_distance = to_location.distance(
-          ego_location) + self._vehicle.bounding_box.extent.x * 2 + self.config.check_path_free_safety_distance
+          ego_location) + self._ego_bb_extent.x * 2 + self.config.check_path_free_safety_distance
       ego_time = compute_min_time_for_distance(ego_distance, min(min_speed, target_speed), ego_speed)
 
       path_clear = True
@@ -755,7 +773,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
           distance_to_leading_actor = float(from_index + 15 -
                                             self._waypoint_planner.route_index) / self.config.points_per_meter
           target_speed = self._compute_target_speed_idm(desired_speed=target_speed,
-                                                        leading_actor_length=self._vehicle.bounding_box.extent.x,
+                                                        leading_actor_length=self._ego_bb_extent.x,
                                                         ego_speed=ego_speed,
                                                         leading_actor_speed=0,
                                                         distance_to_leading_actor=distance_to_leading_actor,
@@ -1427,7 +1445,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
           target_speed_pedestrian = min(
               target_speed_pedestrian,
               self._compute_target_speed_idm(desired_speed=initial_target_speed,
-                                             leading_actor_length=0.5 + self._vehicle.bounding_box.extent.x,
+                                             leading_actor_length=0.5 + self._ego_bb_extent.x,
                                              ego_speed=ego_speed,
                                              leading_actor_speed=0.,
                                              distance_to_leading_actor=distance_to_actor,
@@ -1451,7 +1469,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
   def get_brake_and_target_speed(self, plant, route_points, distance_to_next_traffic_light, next_traffic_light,
                                  distance_to_next_stop_sign, next_stop_sign, vehicle_list, actor_list,
-                                 initial_target_speed, speed_reduced_by_obj):
+                                 initial_target_speed, speed_reduced_by_obj, ego_speed, ego_vehicle_transform):
     """
         Compute the brake command and target speed for the ego vehicle based on various factors.
 
@@ -1467,20 +1485,26 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
             initial_target_speed (float): The initial target speed for the ego vehicle.
             speed_reduced_by_obj (list or None): A list containing [reduced speed, object type, object ID, distance]
                     for the object that caused the most speed reduction, or None if no speed reduction.
+            ego_speed (float): The ego vehicle's current speed in m/s, already read this tick by the caller
+                    (see _get_control()). Passed in rather than re-read here: self._vehicle.get_velocity() is a
+                    CARLA RPC property read whose latency depends heavily on whether this process owns
+                    world.tick() (see forecast_ego_agent()'s bounding_box.extent comment for the same effect on
+                    a passive/non-ticking client), and the vehicle cannot move again before this tick's control
+                    is applied, so a second read in the same tick can only return the same value.
+            ego_vehicle_transform (carla.Transform): The ego vehicle's current transform, already read this tick
+                    by the caller, for the same reason.
 
         Returns:
             tuple: A tuple containing the brake command (bool), target speed (float), and the updated
                     speed_reduced_by_obj list.
         """
-    ego_speed = self._vehicle.get_velocity().length()
     target_speed = initial_target_speed
 
-    ego_vehicle_location = self._vehicle.get_location()
-    ego_vehicle_transform = self._vehicle.get_transform()
+    ego_vehicle_location = ego_vehicle_transform.location
 
     # Calculate the global bounding box of the ego vehicle
-    center_ego_bb_global = ego_vehicle_transform.transform(self._vehicle.bounding_box.location)
-    ego_bb_global = carla.BoundingBox(center_ego_bb_global, self._vehicle.bounding_box.extent)
+    center_ego_bb_global = ego_vehicle_transform.transform(self._ego_bb_location)
+    ego_bb_global = carla.BoundingBox(center_ego_bb_global, self._ego_bb_extent)
     ego_bb_global.rotation = ego_vehicle_transform.rotation
 
     if self.visualize == 1:
@@ -1624,7 +1648,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # Decrease the ego vehicles bounding box if it is slow and resolve permanent bounding box
     # intersectinos at collisions.
     # In case of driving increase them for safety.
-    extent = self._vehicle.bounding_box.extent
+    extent = self._ego_bb_extent
     # Otherwise we would increase the extent of the bounding box of the vehicle
     extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
     extent.x *= self.config.slow_speed_extent_factor_ego if current_ego_speed < \
